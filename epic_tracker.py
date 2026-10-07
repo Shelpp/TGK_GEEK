@@ -1,83 +1,56 @@
-"""
-Трекер бесплатных игр Epic Games Store.
-"""
-
+"""Трекер бесплатных игр Epic Games Store (официальный API)."""
 import logging
-import requests
 from datetime import datetime, timezone
 from typing import Optional
+
+import requests
 
 from telegram_api import escape as tg_escape
 
 logger = logging.getLogger(__name__)
 
-EPIC_API = (
-    "https://store-site-backend-static.ak.epicgames.com"
-    "/freeGamesPromotions?locale=ru&country=RU&allowCountries=RU"
-)
+EPIC_API = ("https://store-site-backend-static.ak.epicgames.com"
+            "/freeGamesPromotions?locale=ru&country=RU&allowCountries=RU")
 EPIC_STORE = "https://store.epicgames.com/ru/p/"
 
 
 def get_free_games() -> list[dict]:
-
     try:
-        r = requests.get(EPIC_API, timeout=15,
-                         headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(EPIC_API, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
-        games_raw = (
-            r.json()
-            .get("data", {})
-            .get("Catalog", {})
-            .get("searchStore", {})
-            .get("elements", [])
-        )
+        games_raw = (r.json().get("data", {}).get("Catalog", {})
+                     .get("searchStore", {}).get("elements", []))
     except Exception as e:
         logger.error(f"Epic API error: {e}")
         return []
 
-    now  = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     free = []
-
     for g in games_raw:
         promos = g.get("promotions") or {}
-        offers = promos.get("promotionalOffers", [])
-
-        for offer_group in offers:
+        for offer_group in promos.get("promotionalOffers", []):
             for offer in offer_group.get("promotionalOffers", []):
                 if offer.get("discountSetting", {}).get("discountPercentage", 100) != 0:
                     continue
-
-                start = _parse_dt(offer.get("startDate"))
-                end   = _parse_dt(offer.get("endDate"))
-
+                start, end = _parse_dt(offer.get("startDate")), _parse_dt(offer.get("endDate"))
                 if not (start and end and start <= now <= end):
                     continue
-
                 slug = (g.get("productSlug") or "").split("/")[0]
-                price_info = (
-                    g.get("price", {})
-                    .get("totalPrice", {})
-                    .get("fmtPrice", {})
-                    .get("originalPrice", "бесплатно")
-                )
-
-                # Обложка
+                price = (g.get("price", {}).get("totalPrice", {})
+                         .get("fmtPrice", {}).get("originalPrice", ""))
                 img_url = ""
                 for img in g.get("keyImages", []):
-                    if img.get("type") in ("DieselStoreFrontWide", "OfferImageWide",
-                                           "Thumbnail"):
+                    if img.get("type") in ("DieselStoreFrontWide", "OfferImageWide", "Thumbnail"):
                         img_url = img.get("url", "")
                         break
-
                 free.append({
-                    "title":          g.get("title", "Неизвестная игра"),
-                    "description":    (g.get("description") or "")[:200],
-                    "url":            EPIC_STORE + slug if slug else "https://store.epicgames.com/ru",
-                    "original_price": price_info,
-                    "end_date":       end.strftime("%d.%m.%Y %H:%M UTC"),
-                    "image_url":      img_url,
+                    "title": g.get("title", "Неизвестная игра"),
+                    "description": (g.get("description") or "")[:200],
+                    "url": EPIC_STORE + slug if slug else "https://store.epicgames.com/ru",
+                    "original_price": price,
+                    "end_date": end.strftime("%d.%m.%Y %H:%M UTC"),
+                    "image_url": img_url,
                 })
-
     return free
 
 
@@ -91,23 +64,18 @@ def _parse_dt(s: str) -> Optional[datetime]:
 
 
 def format_epic_post(games: list[dict]) -> Optional[str]:
-
+    """Ссылки — под описанием каждой игры, в виде кликабельной надписи."""
     if not games:
         return None
-
-    lines = ["🎁 <b>ХАЛЯВА в Epic Games Store!</b>\n"]
+    lines = ["🎁 <b>Бесплатно в Epic Games Store</b>\n"]
     for g in games:
-        title = tg_escape(g["title"])
-        desc  = tg_escape(g["description"]) if g["description"] else ""
-        price = tg_escape(str(g["original_price"]))
-        lines.append(f"🎮 <b>{title}</b>")
-        if desc:
-            lines.append(f"   {desc}")
-        lines.append(f"   💰 Обычная цена: {price}")
-        lines.append(f"   ⏰ До: {g['end_date']}")
-        lines.append(f"   🔗 {g['url']}\n")
-
-    lines.append("🔥 Забирайте пока не закончилась халява!")
-    lines.append("Сохрани чтобы не забыть 🔖")
-    lines.append("\n#epicgames #халява #раздача")
+        lines.append(f"🎮 <b>{tg_escape(g['title'])}</b>")
+        if g["description"]:
+            lines.append(tg_escape(g["description"]))
+        if g["original_price"]:
+            lines.append(f"💰 Обычная цена: {tg_escape(str(g['original_price']))}")
+        lines.append(f"⏰ Раздают до: {g['end_date']}")
+        lines.append(f'🔗 <a href="{g["url"]}">Забрать в Epic Games Store</a>\n')
+    lines.append("Не забудь сохранить пост, чтобы не пропустить 🔖")
+    lines.append("\n#epicgames #раздача #бесплатно")
     return "\n".join(lines)
