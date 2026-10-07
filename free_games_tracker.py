@@ -16,7 +16,7 @@ CHEAPSHARK_DEALS_URL = "https://www.cheapshark.com/api/1.0/deals"
 CHEAPSHARK_REDIRECT = "https://www.cheapshark.com/redirect?dealID={}"
 
 # ⚠️ Впиши реальный контакт (юзернейм канала или email) — требование CheapShark.
-USER_AGENT = "tg_geek_bot_yandex/1.0 (contact: ВПИШИ_СВОЙ_КОНТАКТ)"
+USER_AGENT = "tg_geek_bot_yandex/1.0 (contact: @gamenewsshelp)"
 
 STORE_NAMES = {
     "1": "Steam", "2": "GamersGate", "3": "GreenManGaming", "7": "GOG",
