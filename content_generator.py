@@ -1,283 +1,191 @@
-
-import json
+import html as _html
 import logging
-import random
 import time
 from typing import Optional
 
 import requests
 
-from config import (
-    YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL,
-    GEEK_PRODUCT_TAGS, MARKETPLACES,
-)
-from rss_fetcher import get_news_context
-from telegram_api import escape as tg_escape
+from config import YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL
+from rss_fetcher import get_fresh_news
+from steam_source import pick_game
+from telegram_api import prepare_ai_text
 
 logger = logging.getLogger(__name__)
 
 YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
 # ── Системный промпт ───────────────────────────────────────
-SYSTEM = """Ты — редактор Telegram-канала «Игры и Гик-новости».
-Пишешь живые, цепляющие посты для геймеров и гиков на русском языке.
-Твоя цель — чтобы пост дочитывали до конца, сохраняли и комментировали.
+
+SYSTEM = """Ты — редактор Telegram-канала «Игровые новости». Канал ТОЛЬКО про видеоигры.
+Пишешь живые, цепляющие посты для геймеров на русском языке.
+
+Тематика: видеоигры, игровая индустрия, релизы, анонсы, скидки, раздачи, киберспорт.
+ЗАПРЕЩЕНО писать про: железо и комплектующие, смартфоны, ноутбуки, программирование,
+ИИ и нейросети, инженерные и IT-новости, аниме, кино, гаджеты. Если в данных такое
+встретилось — не используй.
 
 Правила:
-• ПЕРВАЯ СТРОКА — самое важное. Именно она видна в превью уведомления и в
-  списке чата, до того как пользователь откроет пост. Она должна цеплять
-  за 1 секунду: конкретный факт, цифра, интрига или вопрос. Никогда не
-  начинай с общих фраз вроде "Сегодня хотим рассказать" или "Новость дня".
-• Длина: 180–350 слов. Не больше, не меньше.
-• Тон: дружелюбный, экспертный, чуть дерзкий. Как старший друг-гик, а не
-  пресс-релиз.
-• Структура: заголовок-крючок с эмодзи → суть в 1-2 предложениях →
-  конкретная деталь/цифра/сравнение → мнение или инсайт → вопрос к читателю.
-• Короткие абзацы (1-3 строки) — это Telegram, читают с телефона.
-• Никаких шаблонных фраз: «как вы знаете», «стоит отметить», «это очень
-  важно», «в мире технологий».
-• Всегда конкретика: названия игр, цифры, цены в рублях, даты. Если точных
-  данных нет в предоставленном контексте — пиши обобщённо, не выдумывай
-  цифры и факты, которые выдаёшь за подтверждённые.
-• Только эмодзи и переносы строк — никаких # в середине текста и никаких **.
-• Заканчивай ОДНИМ из двух: вопросом, который легко и быстро ответить в
-  комментариях («А вы уже..?», «Согласны?», «Что выберете?») ИЛИ фразой
-  «Сохрани, чтобы не потерять 🔖».
-• В последней строке (отдельной) добавь 2-3 релевантных хэштега строчными
-  буквами без пробелов внутри, например: #геймдев #скидки #anime — только
-  по теме конкретного поста, не универсальный список.
+• ПЕРВАЯ СТРОКА — цепляющий заголовок с одним эмодзи, выдели его **жирным**. Конкретный
+  факт, цифра или интрига. Без фраз вроде «Сегодня расскажем» и «Новость дня».
+• Объём: 450–750 символов. Строго не больше — текст должен помещаться в подпись к картинке.
+• Тон: дружелюбный, экспертный, чуть дерзкий — как старший друг-геймер, не пресс-релиз.
+• Структура: заголовок → суть в 1–2 предложениях → важная деталь или цифра → твоё мнение
+  → короткий вопрос читателю.
+• Короткие абзацы (1–3 строки), между абзацами пустая строка.
+• Ключевые названия игр и цифры можно выделять **жирным** — но не больше 3–4 раз за пост.
+• Никаких шаблонов: «как вы знаете», «стоит отметить», «в мире технологий».
+• ТОЛЬКО факты из предоставленных данных. Не выдумывай цены, даты, оценки и характеристики.
+  Если данных не хватает — пиши обобщённо.
+• НЕ вставляй ссылки и URL — ссылку добавит система.
+• Заканчивай коротким вопросом, на который легко ответить в комментариях.
+• Последняя строка отдельно: 2–3 хэштега строчными буквами, например: #игры #steam #скидки
 • Только русский язык."""
 
 
-def _call_yandex(system: str, user: str, temperature: float = 0.8) -> Optional[str]:
-    """Делает запрос к YandexGPT API и возвращает текст ответа."""
-    model_uri = f"gpt://{YANDEX_FOLDER_ID}/{YANDEX_MODEL}/latest"
-
+def _call_yandex(system: str, user: str, temperature: float = 0.7) -> Optional[str]:
     payload = {
-        "modelUri": model_uri,
-        "completionOptions": {
-            "stream":      False,
-            "temperature": temperature,
-            "maxTokens":   2000,
-        },
+        "modelUri": f"gpt://{YANDEX_FOLDER_ID}/{YANDEX_MODEL}/latest",
+        "completionOptions": {"stream": False, "temperature": temperature, "maxTokens": 1200},
         "messages": [
             {"role": "system", "text": system},
-            {"role": "user",   "text": user},
+            {"role": "user", "text": user},
         ],
     }
     headers = {
-        "Authorization":    f"Api-Key {YANDEX_API_KEY}",
-        "Content-Type":     "application/json",
-        "x-folder-id":      YANDEX_FOLDER_ID,
+        "Authorization": f"Api-Key {YANDEX_API_KEY}",
+        "Content-Type": "application/json",
+        "x-folder-id": YANDEX_FOLDER_ID,
     }
-
     for attempt in range(3):
         try:
             r = requests.post(YANDEX_URL, json=payload, headers=headers, timeout=60)
-
-
             if r.status_code == 429:
                 wait = 65 * (attempt + 1)
                 logger.warning(f"YandexGPT rate limit, жду {wait}с...")
                 time.sleep(wait)
                 continue
-
             r.raise_for_status()
-            data = r.json()
-            text = data["result"]["alternatives"][0]["message"]["text"]
-            return text.strip()
-
-        except requests.HTTPError as e:
+            return r.json()["result"]["alternatives"][0]["message"]["text"].strip()
+        except requests.HTTPError:
             logger.error(f"YandexGPT HTTP {r.status_code}: {r.text[:200]}")
             time.sleep(10)
         except Exception as e:
-            logger.error(f"YandexGPT попытка {attempt+1}: {e}")
+            logger.error(f"YandexGPT попытка {attempt + 1}: {e}")
             time.sleep(10)
-
     return None
 
 
-# ── Промпты по рубрикам ──
+# ── Факты об игре для промпта ──
 
-def _get_prompt(category: str) -> tuple[str, str]:
+def _game_facts(g: dict) -> str:
+    lines = [f"Название: {g['title']}"]
+    if g.get("genres"):
+        lines.append(f"Жанр: {g['genres']}")
+    if g.get("developers"):
+        lines.append(f"Разработчик: {g['developers']}")
+    if g.get("release"):
+        lines.append(f"Дата выхода: {g['release']}")
+    if g.get("discount"):
+        lines.append(f"Скидка: -{g['discount']}%, было {g['old_price']}, стало {g['new_price']} (Steam, Россия)")
+    elif g.get("new_price"):
+        lines.append(f"Цена в Steam: {g['new_price']}")
+    if g.get("description"):
+        lines.append(f"Описание: {g['description']}")
+    return "\n".join(lines)
 
 
-    if category in ("gaming_news", "game_announce", "tech_news"):
-        # Для новостей подгружаем RSS-контекст
-        news_ctx = get_news_context()
-        base = {
-            "gaming_news":   "Выбери одну из новостей ниже и напиши живой пост о ней. Добавь своё мнение.",
-            "game_announce": "Выбери анонс игры из новостей ниже и напиши пост. Жанр, платформы, дата, почему ждать.",
-            "tech_news":     "Выбери технологическую новость из списка ниже и напиши пост для геймера/гика.",
-        }[category]
-
-        user = f"{base}\n\n{news_ctx}" if news_ctx else (
-            base + "\n\nНапиши пост о любой актуальной новости игровой индустрии которую знаешь."
-        )
-        return SYSTEM, user
-
-    prompts = {
-        "game_review": (
-            SYSTEM,
-            "Напиши мини-обзор одной популярной игры (2023–2025). "
-            "Жанр, платформы, плюсы, минусы, кому зайдёт. Живое мнение без оценок."
-        ),
-        "gadget_review": (
-            SYSTEM,
-            "Напиши обзор одного интересного гик-гаджета 2024–2025: "
-            "клавиатура, мышь, гарнитура, контроллер или похожее. "
-            "Что умеет, цена в рублях, где купить в России."
-        ),
-        "geek_gadget": (
-            SYSTEM,
-            "Расскажи о необычном гик-гаджете с изюминкой — не банальные наушники. "
-            "Цена в рублях, где купить, зачем вообще нужно."
-        ),
-        "marketplace_find": _marketplace_prompt(),
-        "epic_freebie": (
-            SYSTEM,
-            "Напиши общий пост про формат бесплатных раздач в Epic Games Store: "
-            "как часто бывают раздачи, как не пропустить, как включить уведомления "
-            "в приложении Epic Games. НЕ называй конкретные игры и даты раздач — "
-            "у тебя нет актуальных данных, а неверная информация о временной акции "
-            "введёт подписчиков в заблуждение. Заверши призывом подписаться на "
-            "уведомления Epic, чтобы не пропускать раздачи."
-        ),
-        "steam_deals": (
-            SYSTEM,
-            "Напиши пост о топ-3 горячих скидках в Steam. "
-            "Для каждой: название, жанр, % скидки, цена со скидкой в рублях. "
-            "Выбирай хорошие игры со скидкой >50%."
-        ),
-        "daily_quiz": (
-            SYSTEM + "\n\nДополнительно: после текста поста добавь викторину в формате:\n"
-            "ВОПРОС: [вопрос]\nА) ...\nБ) ...\nВ) ...\nГ) ...\nОТВЕТ: [буква и объяснение]\n\n"
-            "Используй только широко известные, легко проверяемые факты (даты выхода "
-            "культовых игр, рекорды продаж, известные разработчики/студии). Если не "
-            "уверен в точности факта на 100% — выбери другой, более очевидный вопрос. "
-            "Лучше простой достоверный вопрос, чем эффектный, но сомнительный.",
-            "Напиши короткий вступительный текст (2–3 предложения) и викторину "
-            "по теме игр, кино или технологий. Вопрос должен быть интересным, "
-            "но с однозначно верным и общеизвестным ответом. Попроси написать "
-            "ответ в комментарии."
-        ),
-        "geek_fact": (
-            SYSTEM,
-            "Расскажи один удивительный факт из мира игр, технологий или поп-культуры. "
-            "Что-то, что захочется переслать другу. Только реальные факты."
-        ),
-        "anime_pick": (
-            SYSTEM,
-            "Порекомендуй одно аниме для геймера/гика — 2023–2025 или недооценённая классика. "
-            "Жанр, количество серий, где смотреть в России, почему зайдёт."
-        ),
-        "movie_pick": (
-            SYSTEM,
-            "Порекомендуй фильм или сериал для гика — фантастика, киберпанк, игровая тема. "
-            "Из 2023–2025 или недооценённая классика. Где смотреть в России."
-        ),
+def _result(text: str, category: str, title: str, **kw) -> dict:
+    return {
+        "text": text, "category": category, "title": title,
+        "image_url": kw.get("image_url", ""),
+        "link": kw.get("link", ""), "link_label": kw.get("link_label", "Подробнее"),
+        "seen_key": kw.get("seen_key", ""),
+        "is_poll": kw.get("is_poll", False), "poll_data": kw.get("poll_data"),
     }
-    return prompts.get(category, (SYSTEM, "Напиши интересный пост об играх или технологиях для гиков."))
 
 
-def _marketplace_prompt() -> tuple[str, str]:
-    mp  = random.choice(MARKETPLACES)
-    tag = random.choice(GEEK_PRODUCT_TAGS)
-    return (
-        SYSTEM,
-        f"Напиши пост-находку о конкретном товаре категории «{tag}» с {mp}. "
-        f"Придумай реальный пример: название, характеристики, цена в рублях (актуальная 2025), "
-        f"рейтинг, почему это крутая покупка для гика. Скажи честно — стоит ли брать. "
-        f"В конце: «Ищите на {mp}: [название товара]»"
-    )
+# ── Генерация по рубрикам ──
 
-
-# ── Основная функция ──
-
-def generate_post(category: str) -> dict:
+def generate_post(category: str) -> Optional[dict]:
     logger.info(f"🤖 YandexGPT генерирует [{category}]...")
 
-    system, user = _get_prompt(category)
-    text = _call_yandex(system, user)
+    # 1. Новости — реальная новость из RSS, её картинка и ссылка
+    if category == "gaming_news":
+        n = get_fresh_news()
+        if not n:
+            logger.warning("Свежих игровых новостей нет")
+            return None
+        user = (f"Напиши пост об этой новости. Не придумывай деталей сверх данных.\n\n"
+                f"Заголовок: {n['title']}\nКратко: {n['summary']}")
+        raw = _call_yandex(SYSTEM, user)
+        if not raw:
+            return None
+        return _result(prepare_ai_text(raw), category, n["title"], image_url=n["image"],
+                       link=n["link"], link_label=f"Источник: {n['source'] or 'читать полностью'}",
+                       seen_key="news:" + n["link"])
 
-    if not text:
-        logger.error(f"YandexGPT не ответил для [{category}], fallback")
-        return _fallback(category)
+    # 2. Игры из Steam — реальные данные, обложка и ссылка на страницу игры
+    if category in ("steam_deals", "game_review", "game_announce"):
+        kind = {"steam_deals": "deal", "game_review": "review", "game_announce": "announce"}[category]
+        g = pick_game(kind)
+        if not g:
+            logger.warning(f"Steam: нет новых игр для [{category}]")
+            return None
+        task = {
+            "deal": "Напиши пост о скидке на эту игру: почему стоит взять, кому зайдёт. Цены — строго из данных.",
+            "review": "Напиши мини-обзор этой игры: суть, за что любят, кому зайдёт. Без выдуманных оценок.",
+            "announce": "Напиши пост-анонс этой игры: жанр, дата выхода, почему её ждать.",
+        }[kind]
+        raw = _call_yandex(SYSTEM, f"{task}\n\nДанные:\n{_game_facts(g)}")
+        if not raw:
+            return None
+        title = g["title"] if kind != "deal" else f"{g['title']}: скидка {g['discount']}%"
+        return _result(prepare_ai_text(raw), category, title, image_url=g["image_url"],
+                       link=g["url"], link_label="Страница игры в Steam", seen_key=g["seen_key"])
 
-    # Экранируем спецсимволы HTML (&, <, >), чтобы Telegram не отклонил
-    # пост ошибкой "can't parse entities", если модель случайно вставит
-    # такой символ (например, "5 < 10" или "Cyberpunk 2077 & DLC").
-    text = tg_escape(text)
+    # 3. Факт и викторина — без источника
+    if category == "game_fact":
+        raw = _call_yandex(SYSTEM, "Расскажи один удивительный и ПРОВЕРЕННЫЙ факт из истории или "
+                                   "разработки известной видеоигры. Такой, что захочется переслать другу. "
+                                   "Если не уверен в точности — выбери другой, более известный факт.")
+        if not raw:
+            return None
+        return _result(prepare_ai_text(raw), category, "Знали ли вы? Факт из мира игр")
 
-    image_query = _build_image_query(category)
-    needs_image = category in (
-        "gaming_news", "game_announce", "game_review",
-        "gadget_review", "geek_gadget", "marketplace_find",
-        "anime_pick", "movie_pick",
-    )
+    if category == "daily_quiz":
+        system = SYSTEM + (
+            "\n\nДополнительно: после вступления добавь викторину строго в формате:\n"
+            "ВОПРОС: [вопрос]\nА) ...\nБ) ...\nВ) ...\nГ) ...\nОТВЕТ: [буква и короткое объяснение]\n"
+            "Только широко известные и легко проверяемые факты о видеоиграх. "
+            "Лучше простой достоверный вопрос, чем эффектный, но сомнительный.")
+        raw = _call_yandex(system, "Напиши короткое вступление (1–2 предложения) и викторину по видеоиграм. "
+                                   "Попроси написать ответ в комментариях.")
+        if not raw:
+            return None
+        poll = _extract_poll(raw)
+        if not poll:
+            logger.warning("Не удалось разобрать викторину")
+            return None
+        # в текст поста идут вступление и ответ, сам вопрос — в нативном опросе
+        text_raw = "\n".join(l for l in raw.split("\n")
+                             if not l.strip().upper().startswith("ВОПРОС:")
+                             and not l.strip().startswith(("А)", "Б)", "В)", "Г)")))
+        return _result(prepare_ai_text(text_raw), category, "Игровая викторина",
+                       is_poll=True, poll_data=poll)
 
-    # Викторина
-    is_poll   = category == "daily_quiz"
-    poll_data = _extract_poll(text) if is_poll else None
-
-    logger.info(f"✅ [{category}] готово ({len(text)} симв.)")
-    return {
-        "text":        text,
-        "category":    category,
-        "image_query": image_query,
-        "needs_image": needs_image,
-        "is_poll":     is_poll,
-        "poll_data":   poll_data,
-    }
-
-
-def _build_image_query(category: str) -> str:
-    queries = {
-        "gaming_news":     "video game news 2025 gaming",
-        "game_announce":   "new video game announcement epic cinematic",
-        "tech_news":       "gaming technology GPU gadget 2025",
-        "game_review":     "video game screenshot gameplay",
-        "gadget_review":   "mechanical keyboard gaming mouse RGB",
-        "geek_gadget":     "cool geek gadget neon tech",
-        "marketplace_find":"gaming product buy online",
-        "epic_freebie":    "epic games store free game",
-        "steam_deals":     "steam sale discount gaming",
-        "daily_quiz":      "gaming quiz trivia neon",
-        "geek_fact":       "mind blowing tech fact science",
-        "anime_pick":      "anime art illustration 2024",
-        "movie_pick":      "sci-fi movie cinematic poster",
-    }
-    return queries.get(category, "gaming geek neon 2025")
+    logger.error(f"Неизвестная рубрика: {category}")
+    return None
 
 
 def _extract_poll(text: str) -> Optional[dict]:
-    # text уже экранирован для HTML (send_message), но нативный Telegram-опрос
-    # (sendPoll) не рендерит HTML-разметку — поэтому вопрос/варианты нужно
-    # вернуть в "сыром" виде, разэкранировав спецсимволы обратно.
-    import html as _html
     question, options = "", []
     for line in text.split("\n"):
-        line = line.strip()
+        line = line.strip().lstrip("*_ ").replace("**", "")
         if line.upper().startswith("ВОПРОС:"):
             question = line.split(":", 1)[1].strip()
         elif line.startswith(("А)", "Б)", "В)", "Г)")):
             options.append(line[2:].strip())
     if question and len(options) >= 2:
-        question = _html.unescape(question)[:300]
-        options  = [_html.unescape(o) for o in options][:4]
-        return {"question": question, "options": options}
+        return {"question": _html.unescape(question)[:300],
+                "options": [_html.unescape(o) for o in options][:4]}
     return None
-
-
-def _fallback(category: str) -> dict:
-    return {
-        "text": (
-            "🎮 Технические работы — скоро вернёмся!\n\n"
-            "А пока: во что играете прямо сейчас? 👇"
-        ),
-        "category":    category,
-        "image_query": "gaming setup neon",
-        "needs_image": False,
-        "is_poll":     False,
-        "poll_data":   None,
-    }
